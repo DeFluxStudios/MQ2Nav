@@ -37,6 +37,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -46,6 +47,9 @@
 #include <unordered_set>
 #include <vector>
 #include <Windows.h>
+#include <bcrypt.h>
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace fs = std::filesystem;
 
@@ -159,18 +163,20 @@ namespace
 			"        --max-slope --region-min-size --region-merge-size --edge-max-len --edge-max-error\n"
 			"        --verts-per-poly --detail-sample-dist --detail-sample-max-error\n"
 			"      Fixes:    [--carry-from MESH] [--fixes FILE] [--connections FILE] [--volumes FILE]\n"
-			"      Region:   [--base MESH [--tiles \"Y1,X1:Y2,X2\"]]  rebuild only those tiles and the tiles\n"
+			"      Region:   [--base MESH [--box \"Y1,X1:Y2,X2\"]]  rebuild only those tiles and the tiles\n"
 			"                new links or volumes touch; settings come from the base mesh\n"
 			"      Other:    [--walkways] [--auto-drops FILE [--max-drop N] [--drop-spacing N]]\n"
 			"                [--threads N] [--mesh-version 4|5] [--allow-live]\n"
 			"      A stage root inside a MacroQuest install is refused unless --allow-live is given.\n"
 			"  validate --zone Z --mesh PATH\n"
 			"  export   --zone Z --mesh PATH --out FILE        links, volumes, areas and settings as JSON\n"
-			"  diff     --zone Z --old MESH --new MESH [--tolerance N]   exit 6 when fixes were lost\n"
+			"  diff     --zone Z --old MESH --new MESH [--tolerance N] [--strict]   exit 6 when fixes were lost;\n"
+			"           --strict also fails on changed settings or tile geometry\n"
 			"  path     --zone Z --mesh PATH --from \"Y,X,Z\" --to \"Y,X,Z\" [--extents X,Y,Z]\n"
 			"  reach    --zone Z --mesh PATH --from \"Y,X,Z\" [--min-polys N] [--limit N] [--extents X,Y,Z]\n"
 			"  inspect  --zone Z --mesh PATH --at \"Y,X,Z\" [--radius N] [--extents X,Y,Z]\n"
 			"  probe    --zone Z --mesh PATH (--points \"Y,X,Z;Y,X,Z\" | --routes FILE) [--extents X,Y,Z]\n"
+			"           routes: name, points, optional expect, maxLength, endZ and endTolerance (default 5)\n"
 			"  config   [--ini PATH]                            what the GUI's MeshGenerator.ini resolves to\n"
 			"\n"
 			"Points are /loc order (Y,X,Z). JSON files use mesh axes [x,y,z] with y up, as export writes them.\n"
@@ -319,6 +325,38 @@ namespace
 		if (document.HasParseError())
 			throw CliError(2, "bad_" + code, "Not valid JSON: " + path);
 		return document;
+	}
+
+	// SHA-256 of a file as upper-case hex, or "" when it cannot be read.
+	std::string FileSha256(const fs::path& path)
+	{
+		std::ifstream file(path, std::ios::binary);
+		if (!file)
+			return "";
+		BCRYPT_ALG_HANDLE alg = nullptr;
+		BCRYPT_HASH_HANDLE hash = nullptr;
+		if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+			return "";
+		std::string result;
+		if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) == 0)
+		{
+			std::vector<char> chunk(1 << 16);
+			bool ok = true;
+			while (ok && file)
+			{
+				file.read(chunk.data(), chunk.size());
+				const auto got = file.gcount();
+				if (got > 0)
+					ok = BCryptHashData(hash, reinterpret_cast<PUCHAR>(chunk.data()), static_cast<ULONG>(got), 0) == 0;
+			}
+			unsigned char digest[32];
+			if (ok && BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0)
+				for (unsigned char b : digest)
+					result += fmt::format("{:02X}", b);
+			BCryptDestroyHash(hash);
+		}
+		BCryptCloseAlgorithmProvider(alg, 0);
+		return result;
 	}
 
 	void WriteNewFile(const fs::path& path, const std::string& text)
@@ -985,7 +1023,9 @@ namespace
 			throw CliError(2, "conflict", "--base takes its settings from the base mesh; drop the settings options.");
 		if (regionBuild && options.count("--carry-from"))
 			throw CliError(2, "conflict", "--base already keeps the base mesh's fixes; drop --carry-from.");
-		if (options.count("--tiles") && !regionBuild)
+		if (options.count("--tiles") && options.count("--box"))
+			throw CliError(2, "conflict", "--box and --tiles are the same option; give one.");
+		if ((options.count("--tiles") || options.count("--box")) && !regionBuild)
 			throw CliError(2, "conflict", "--tiles needs --base.");
 		if (options.count("--preset") && options.count("--settings-from"))
 			throw CliError(2, "conflict", "Use --preset or --settings-from, not both.");
@@ -1161,12 +1201,12 @@ namespace
 				}
 			};
 
-			if (options.count("--tiles"))
+			if (options.count("--tiles") || options.count("--box"))
 			{
-				const std::string region = options.at("--tiles");
+				const std::string region = options.count("--box") ? options.at("--box") : options.at("--tiles");
 				const size_t colon = region.find(':');
 				if (colon == std::string::npos)
-					throw CliError(2, "bad_tiles", "--tiles must be \"Y1,X1:Y2,X2\" in /loc order.");
+					throw CliError(2, "bad_tiles", "--box must be \"Y1,X1:Y2,X2\" in /loc order.");
 				const glm::vec3 a = ParseLoc(region.substr(0, colon) + ",0", "--tiles");
 				const glm::vec3 b = ParseLoc(region.substr(colon + 1) + ",0", "--tiles");
 				addBox((std::min)(a.x, b.x), (std::max)(a.x, b.x), (std::min)(a.z, b.z), (std::max)(a.z, b.z));
@@ -1204,7 +1244,7 @@ namespace
 					"rebuild only rebuilds existing tiles. Do a full build instead. Empty cells: " + list);
 			}
 			if (tiles.empty())
-				throw CliError(2, "no_tiles", "Nothing to rebuild: give --tiles, or links or volumes that touch existing tiles.");
+				throw CliError(2, "no_tiles", "Nothing to rebuild: give --box, or links or volumes that touch existing tiles.");
 			rebuilt.assign(tiles.begin(), tiles.end());
 			spdlog::info("Rebuilding {} tiles of the base mesh.", rebuilt.size());
 			navMeshTool.RebuildTiles(rebuilt);
@@ -1294,6 +1334,21 @@ namespace
 		w.Key("validation"); w.String("passed");
 		w.Key("headerVersion"); w.Int(headerVersion);
 		w.Key("settingsSource"); w.String(settingsSource.c_str());
+		w.Key("generator"); w.String("MeshGenerator headless CLI 2026-11-25");
+		w.Key("inputs");
+		w.StartObject();
+		for (const char* key : { "--base", "--settings-from", "--carry-from", "--fixes", "--connections", "--volumes" })
+		{
+			if (!options.count(key))
+				continue;
+			const fs::path input = PathOption(options, key);
+			w.Key(key + 2);
+			w.StartObject();
+			w.Key("file"); w.String(input.string().c_str());
+			w.Key("sha256"); w.String(FileSha256(input).c_str());
+			w.EndObject();
+		}
+		w.EndObject();
 		w.Key("settings"); WriteSettings(w, navMeshTool.GetConfig());
 		w.Key("walkways"); w.Bool(options.count("--walkways") > 0);
 		w.Key("carried");
@@ -1415,7 +1470,8 @@ namespace
 				if (same || swapped)
 				{
 					linkUsed[i] = found = true;
-					if (o->bidirectional != n->bidirectional || o->areaType != n->areaType || o->name != n->name)
+					if (o->bidirectional != n->bidirectional || o->areaType != n->areaType || o->name != n->name
+						|| o->type != n->type)
 						changedLinks.push_back(o.get());
 				}
 			}
@@ -1436,9 +1492,22 @@ namespace
 				if (volUsed[i] || n->verts.size() != o->verts.size()
 					|| std::fabs(n->hmin - o->hmin) > tol || std::fabs(n->hmax - o->hmax) > tol)
 					continue;
-				bool same = true;
-				for (size_t v = 0; v < o->verts.size() && same; ++v)
-					same = closeTo(o->verts[v], n->verts[v]);
+				// Same outline whatever vertex the list starts at, in either winding.
+				const size_t count = o->verts.size();
+				bool same = false;
+				for (size_t shift = 0; shift < count && !same; ++shift)
+				{
+					for (int dir = 1; dir >= -1 && !same; dir -= 2)
+					{
+						bool all = true;
+						for (size_t v = 0; v < count && all; ++v)
+						{
+							const size_t k = (shift + count + dir * static_cast<long long>(v) % static_cast<long long>(count)) % count;
+							all = closeTo(o->verts[v], n->verts[k]);
+						}
+						same = all;
+					}
+				}
 				if (same)
 				{
 					volUsed[i] = found = true;
@@ -1468,12 +1537,77 @@ namespace
 
 		const size_t lost = lostLinks.size() + lostVols.size() + lostAreas.size();
 
+		// Tile geometry: a tile changed when its polygon count or vertices differ. Hand-built tiles
+		// that a rebuild cannot reproduce show up here even when no link or volume was lost.
+		struct TileKey { int x, y, layer; bool operator<(const TileKey& o) const { return std::tie(x, y, layer) < std::tie(o.x, o.y, o.layer); } };
+		const auto tileSignatures = [](const dtNavMesh* mesh) {
+			std::map<TileKey, std::pair<uint64_t, std::array<float, 4>>> out;
+			for (int i = 0; i < mesh->getMaxTiles(); ++i)
+			{
+				const dtMeshTile* tile = mesh->getTile(i);
+				if (!tile || !tile->header)
+					continue;
+				uint64_t h = 1469598103934665603ull;
+				const auto mix = [&h](const void* data, size_t size) {
+					const unsigned char* bytes = static_cast<const unsigned char*>(data);
+					for (size_t b = 0; b < size; ++b) { h ^= bytes[b]; h *= 1099511628211ull; }
+				};
+				mix(&tile->header->polyCount, sizeof(int));
+				for (int v = 0; v < tile->header->vertCount * 3; ++v)
+				{
+					const int rounded = static_cast<int>(std::lround(tile->verts[v] * 10.0f));
+					mix(&rounded, sizeof(rounded));
+				}
+				out[{ tile->header->x, tile->header->y, tile->header->layer }] = { h,
+					{ tile->header->bmin[0], tile->header->bmin[2], tile->header->bmax[0], tile->header->bmax[2] } };
+			}
+			return out;
+		};
+		const auto oldTiles = tileSignatures(oldMesh->GetNavMesh().get());
+		const auto newTiles = tileSignatures(newMesh->GetNavMesh().get());
+		std::vector<std::pair<TileKey, std::array<float, 4>>> changedTiles;
+		size_t tilesOnlyOld = 0, tilesOnlyNew = 0;
+		for (const auto& [key, sig] : oldTiles)
+		{
+			const auto it = newTiles.find(key);
+			if (it == newTiles.end())
+				++tilesOnlyOld;
+			else if (it->second.first != sig.first)
+				changedTiles.emplace_back(key, sig.second);
+		}
+		for (const auto& [key, sig] : newTiles)
+			if (!oldTiles.count(key))
+				++tilesOnlyNew;
+		bool settingsDiffer = false;
+		for (const Setting& s : kSettings)
+			if (std::fabs(oldMesh->GetNavMeshConfig().*s.field - newMesh->GetNavMeshConfig().*s.field) > 1e-4f)
+				settingsDiffer = true;
+		const bool strict = options.count("--strict") > 0;
+
 		rapidjson::StringBuffer buffer;
 		Json w(buffer);
 		w.StartObject();
 		w.Key("ok"); w.Bool(true);
 		w.Key("command"); w.String("diff");
 		w.Key("lost"); w.Uint64(lost);
+		w.Key("tileGeometry");
+		w.StartObject();
+		w.Key("changed"); w.Uint64(changedTiles.size());
+		w.Key("onlyOld"); w.Uint64(tilesOnlyOld);
+		w.Key("onlyNew"); w.Uint64(tilesOnlyNew);
+		w.Key("changedTiles");
+		w.StartArray();
+		for (size_t i = 0; i < changedTiles.size() && i < 50; ++i)
+		{
+			const auto& [key, box] = changedTiles[i];
+			w.StartObject();
+			w.Key("tile"); w.StartArray(); w.Int(key.x); w.Int(key.y); w.Int(key.layer); w.EndArray();
+			w.Key("locY"); w.StartArray(); w.Double(Round1(box[1])); w.Double(Round1(box[3])); w.EndArray();
+			w.Key("locX"); w.StartArray(); w.Double(Round1(box[0])); w.Double(Round1(box[2])); w.EndArray();
+			w.EndObject();
+		}
+		w.EndArray();
+		w.EndObject();
 		w.Key("tolerance"); w.Double(tol);
 		w.Key("tiles");
 		w.StartObject();
@@ -1570,7 +1704,8 @@ namespace
 		w.EndObject();
 		w.EndObject();
 		Emit(buffer);
-		return lost > 0 ? 6 : 0;
+		const bool strictFail = strict && (settingsDiffer || !changedTiles.empty() || tilesOnlyOld > 0 || tilesOnlyNew > 0);
+		return (lost > 0 || strictFail) ? 6 : 0;
 	}
 
 	template <typename Writer>
@@ -1841,7 +1976,16 @@ namespace
 		if (options.count("--points") == options.count("--routes"))
 			throw CliError(2, "invalid_argument", "probe needs --points or --routes (one of them).");
 
-		struct Route { std::string name; std::vector<glm::vec3> points; bool expectReach = true; float maxLength = 0; };
+		struct Route
+		{
+			std::string name;
+			std::vector<glm::vec3> points;
+			bool expectReach = true;
+			float maxLength = 0;
+			bool hasEndZ = false;
+			float endZ = 0;
+			float endTolerance = 5.0f;
+		};
 		std::vector<Route> routes;
 		std::vector<glm::vec3> locs;
 		if (options.count("--routes"))
@@ -1881,6 +2025,19 @@ namespace
 						throw CliError(2, "bad_routes", "maxLength must be a positive number.");
 					route.maxLength = item["maxLength"].GetFloat();
 				}
+				if (item.HasMember("endZ"))
+				{
+					if (!item["endZ"].IsNumber())
+						throw CliError(2, "bad_routes", "endZ must be a number (the height the route should end at, /loc Z).");
+					route.hasEndZ = true;
+					route.endZ = item["endZ"].GetFloat();
+				}
+				if (item.HasMember("endTolerance"))
+				{
+					if (!item["endTolerance"].IsNumber() || item["endTolerance"].GetFloat() <= 0)
+						throw CliError(2, "bad_routes", "endTolerance must be a positive number.");
+					route.endTolerance = item["endTolerance"].GetFloat();
+				}
 				routes.push_back(std::move(route));
 			}
 		}
@@ -1915,6 +2072,8 @@ namespace
 			{
 				bool allFound = true;
 				float total = 0;
+				bool haveEnd = false;
+				float end[3] = { 0, 0, 0 };
 				w.StartObject();
 				w.Key("name"); w.String(route.name.c_str());
 				w.Key("expect"); w.String(route.expectReach ? "reach" : "noreach");
@@ -1925,6 +2084,11 @@ namespace
 					const PathResult leg = PlanPath(*query, filter, extents, route.points[i - 1], route.points[i]);
 					allFound = allFound && leg.status == "found";
 					total += leg.length;
+					if (i + 1 == route.points.size() && leg.status == "found" && leg.verts.size() >= 3)
+					{
+						dtVcopy(end, &leg.verts[leg.verts.size() - 3]);
+						haveEnd = true;
+					}
 					w.StartObject();
 					w.Key("from"); WriteLoc(w, glm::value_ptr(route.points[i - 1]));
 					w.Key("to"); WriteLoc(w, glm::value_ptr(route.points[i]));
@@ -1934,12 +2098,27 @@ namespace
 					w.EndObject();
 				}
 				w.EndArray();
+				// Where the route really ends, against the target: the search box can snap the end to
+				// another floor or a ledge below. The horizontal gap always counts; the height counts
+				// when the route gives endZ (best taken from where a character stopped in game).
+				const glm::vec3& target = route.points.back();
+				const float endGapXZ = haveEnd ? std::hypot(end[0] - target.x, end[2] - target.z) : 0.0f;
+				const float endGapZ = haveEnd ? std::fabs(end[1] - (route.hasEndZ ? route.endZ : target.y)) : 0.0f;
+				const bool endOk = !haveEnd || (endGapXZ <= route.endTolerance * 2
+					&& (!route.hasEndZ || endGapZ <= route.endTolerance));
 				const bool pass = route.expectReach
-					? (allFound && (route.maxLength <= 0 || total <= route.maxLength))
+					? (allFound && endOk && (route.maxLength <= 0 || total <= route.maxLength))
 					: !allFound;
 				pass ? ++passed : ++failed;
 				w.Key("found"); w.Bool(allFound);
 				w.Key("length"); w.Double(Round1(total));
+				if (haveEnd)
+				{
+					w.Key("endLoc"); WriteLoc(w, end);
+					w.Key("endGapXZ"); w.Double(Round1(endGapXZ));
+					w.Key("endGapZ"); w.Double(Round1(endGapZ));
+					w.Key("endOk"); w.Bool(endOk);
+				}
 				if (route.maxLength > 0)
 				{
 					w.Key("maxLength"); w.Double(route.maxLength);
@@ -2133,7 +2312,7 @@ int RunHeadlessCli(int argc, char* argv[])
 		{
 			std::set<std::string> values = { "--zone", "--eq-path", "--stage-root", "--mesh-root",
 				"--preset", "--settings-from", "--carry-from", "--fixes", "--connections", "--volumes",
-				"--base", "--tiles", "--auto-drops", "--max-drop", "--drop-spacing", "--threads", "--mesh-version" };
+				"--base", "--tiles", "--box", "--auto-drops", "--max-drop", "--drop-spacing", "--threads", "--mesh-version" };
 			for (const Setting& setting : kSettings)
 				values.insert(setting.name);
 			return BuildMesh(ParseOptions(argc, argv, values, { "--no-max-extents", "--walkways", "--allow-live" }));
@@ -2143,7 +2322,7 @@ int RunHeadlessCli(int argc, char* argv[])
 		if (command == "export")
 			return ExportFixes(ParseOptions(argc, argv, { "--zone", "--mesh", "--out" }, {}));
 		if (command == "diff")
-			return DiffMeshes(ParseOptions(argc, argv, { "--zone", "--old", "--new", "--tolerance" }, {}));
+			return DiffMeshes(ParseOptions(argc, argv, { "--zone", "--old", "--new", "--tolerance" }, { "--strict" }));
 		if (command == "path")
 			return PathCommand(ParseOptions(argc, argv, { "--zone", "--mesh", "--from", "--to", "--extents" }, {}));
 		if (command == "reach")

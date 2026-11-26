@@ -84,7 +84,7 @@ MeshGenerator has headless commands for building, checking and comparing meshes.
 | `build` | Builds a zone into `<stage-root>\MQ2Nav\<zone>.navmesh` and validates it with MQ2Nav's own loader. |
 | `validate` | Loads a mesh and reports tiles, polygons, walkable area, links and volumes. |
 | `export` | Writes a mesh's off-mesh links, area volumes, area types and settings to one JSON file. |
-| `diff` | Compares two meshes: lost, added and changed links, volumes and area types, settings, tile and polygon counts. |
+| `diff` | Compares two meshes: lost, added and changed links, volumes and area types, settings, tile and polygon counts, and which tiles' geometry changed. |
 | `path` | Plans a route the way the plugin does (same filter, search box, node pool growth and straight path flags). |
 | `reach` | Floods the mesh from a point and lists the places that can't be reached, with a sample `/loc` for each. |
 | `inspect` | Reports the polygon, area, flags and tile at a point, and the links and volumes near it. |
@@ -95,13 +95,13 @@ MeshGenerator has headless commands for building, checking and comparing meshes.
 
 - **Settings.** `--preset mq2nav|triune` or `--settings-from MESH`, then any single setting on top (`--tile-size`, `--cell-size`, `--cell-height`, `--agent-height`, `--agent-radius`, `--max-climb`, `--max-slope`, `--region-min-size`, `--region-merge-size`, `--edge-max-len`, `--edge-max-error`, `--verts-per-poly`, `--detail-sample-dist`, `--detail-sample-max-error`). Limits follow the GUI sliders. MQ2Nav's defaults apply when nothing is given.
 - **Keeping fixes.** `--carry-from MESH` copies another mesh's links, volumes and area types into the build. `--fixes FILE` reads what `export` writes. `--connections FILE` and `--volumes FILE` take JSON arrays.
-- **Region rebuild.** `--base MESH` loads an existing mesh and rebuilds only the tiles touched by `--tiles "Y1,X1:Y2,X2"` (a `/loc` box) and by any new links or volumes. Settings come from the base. Grid cells with no tile in the base are refused, with a list, because building them would add mesh nobody reviewed.
+- **Region rebuild.** `--base MESH` loads an existing mesh and rebuilds only the tiles touched by `--box "Y1,X1:Y2,X2"` (a `/loc` box; `--tiles` is the older name) and by any new links or volumes. Settings come from the base. Grid cells with no tile in the base are refused, with a list, because building them would add mesh nobody reviewed.
 - **Walkways.** With `--walkways`, volumes whose name starts with `walkway` keep their spans through the ledge filter and the agent-radius erosion, so narrow logs, planks and ledges stay walkable. The headroom filter still runs.
 - **Drop links.** `--auto-drops FILE` writes one-way drop link candidates to a review file (open edge, no floor just past it, ground below within `--max-drop`, clear lines outward and down). They are never added; feed the reviewed file back with `--connections`.
 - **Other.** `--threads N` caps the build threads. `--mesh-version 4|5` picks the file version; carried and region builds keep the input mesh's version. `--mesh-root` points to the MacroQuest resources root used to find `MQ2Nav\<zone>_doors.json` and defaults to `--eq-path`. `--no-max-extents` skips MQ2Nav's built-in zone bounds.
 - **Live folder guard.** A stage root inside a MacroQuest install is refused unless `--allow-live` is given.
 
-The build result also lists links whose ends are no longer on the mesh.
+The build result also lists links whose ends are no longer on the mesh, and records each input file with its SHA-256.
 
 #### Coordinates and files
 
@@ -120,9 +120,12 @@ A routes file for `probe --routes` is a JSON array:
 [
   {"name": "dock to mine", "points": "0,0,-63.8;0,25,-63.8"},
   {"name": "no shortcut over the wall", "points": [[0, 0, -63.8], [120, 40, -60]], "expect": "noreach"},
-  {"name": "not a long detour", "points": "0,0,-63.8;20,0,-63.8", "maxLength": 60}
+  {"name": "not a long detour", "points": "0,0,-63.8;20,0,-63.8", "maxLength": 60},
+  {"name": "ends on the right floor", "points": "0,0,-63.8;0,25,-63.8", "endZ": -63.4, "endTolerance": 3}
 ]
 ```
+
+Each route also reports where it really ends (`endLoc`) and the gap to the target. A route fails when that end is more than twice `endTolerance` (default 5) away across, or, when `endZ` is given, more than `endTolerance` away in height. Take `endZ` from where a character really stops in game: the search box can snap a target onto another floor.
 
 #### Rebuilding without losing fixes
 
@@ -134,11 +137,11 @@ A routes file for `probe --routes` is a JSON array:
 .\MeshGenerator.exe probe --zone everfrost --mesh "C:\NavMesh-Staging\MQ2Nav\everfrost.navmesh" --routes "C:\NavFixes\everfrost_routes.json"
 ```
 
-Copy the staged mesh into place yourself, after a backup, only when `diff` reports no lost fixes and every route passes.
+Copy the staged mesh into place yourself, after a backup, only when `diff` reports no lost fixes and every route passes. Add `--strict` to `diff` to also fail on changed settings or tile geometry. A mesh with hand-built tiles will show changed tiles after a full rebuild even when no fix was lost; change those meshes with `--base` region builds instead.
 
 #### Exit codes
 
-`0` success, `2` invalid arguments, `3` missing input, `4` build or write error, `5` mesh validation error, `6` a check failed (`diff` found lost fixes, a `probe` route failed, `path` found no full route, `reach` listed unreachable places), `70` unexpected failure.
+`0` success, `2` invalid arguments, `3` missing input, `4` build or write error, `5` mesh validation error, `6` a check failed (`diff` found lost fixes or, with `--strict`, changes; a `probe` route failed, `path` found no full route, `reach` listed unreachable places), `70` unexpected failure.
 
 The program is a console application so shells capture its output. Started from Explorer, the GUI lets go of the console window Windows gives it.
 
