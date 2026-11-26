@@ -12,7 +12,8 @@
 
 #include <array>
 #include <cfloat>
-#include <set>
+#include <algorithm>
+#include <cmath>
 #include <vector>
 #include <DetourCommon.h>
 #include <DetourNavMesh.h>
@@ -116,7 +117,7 @@ namespace
 
 	void PrintUsage()
 	{
-		fmt::print(
+		fmt::print("{}",
 			"MeshGenerator headless commands:\n"
 			"  MeshGenerator.exe build --zone SHORTNAME --eq-path PATH --stage-root PATH [--mesh-root PATH] [--no-max-extents]\n"
 			"      [--tile-size N] [--cell-size N] [--cell-height N] [--agent-height N] [--agent-radius N]\n"
@@ -125,7 +126,7 @@ namespace
 			"      [--connections FILE]   JSON array of {\"start\":[x,y,z],\"end\":[x,y,z]} in mesh axes, y up\n"
 			"      [--volumes FILE]       JSON array of {\"verts\":[[x,y,z],...],\"hmin\":N,\"hmax\":N,\"area\":N}\n"
 			"  MeshGenerator.exe validate --zone SHORTNAME --mesh PATH\n"
-			"  MeshGenerator.exe probe --zone SHORTNAME --mesh PATH --points FILE\n"
+			"  MeshGenerator.exe probe --zone SHORTNAME --mesh PATH --points \"Y,X,Z;Y,X,Z\"   /loc order, never writes\n"
 			"\n"
 			"Build writes <stage-root>\\MQ2Nav\\<zone>.navmesh and never overwrites an existing file.\n"
 			"Progress and diagnostics are written to stderr; each command writes one JSON result to stdout.\n");
@@ -278,36 +279,45 @@ namespace
 		// Optional settings. Anything not given keeps the MQ2Nav default.
 		{
 			NavMeshConfig& config = navMeshTool.GetConfig();
-			const std::pair<const char*, float*> settings[] = {
-				{ "--tile-size", &config.tileSize },
-				{ "--cell-size", &config.cellSize },
-				{ "--cell-height", &config.cellHeight },
-				{ "--agent-height", &config.agentHeight },
-				{ "--agent-radius", &config.agentRadius },
-				{ "--max-climb", &config.agentMaxClimb },
-				{ "--max-slope", &config.agentMaxSlope },
-				{ "--region-min-size", &config.regionMinSize },
-				{ "--region-merge-size", &config.regionMergeSize },
-				{ "--detail-sample-dist", &config.detailSampleDist },
-				{ "--detail-sample-max-error", &config.detailSampleMaxError },
+			struct Setting { const char* name; float* field; float low; float high; bool whole; };
+			// Limits follow the MeshGenerator settings sliders, so the CLI can't build what the GUI can't.
+			const Setting settings[] = {
+				{ "--tile-size", &config.tileSize, 16.0f, 1024.0f, true },
+				{ "--cell-size", &config.cellSize, 0.1f, 1.0f, false },
+				{ "--cell-height", &config.cellHeight, 0.1f, 1.0f, false },
+				{ "--agent-height", &config.agentHeight, 0.1f, 15.0f, false },
+				{ "--agent-radius", &config.agentRadius, 0.1f, 15.0f, false },
+				{ "--max-climb", &config.agentMaxClimb, 0.1f, 15.0f, false },
+				{ "--max-slope", &config.agentMaxSlope, 0.0f, 90.0f, false },
+				{ "--region-min-size", &config.regionMinSize, 0.0f, 150.0f, false },
+				{ "--region-merge-size", &config.regionMergeSize, 0.0f, 150.0f, false },
+				{ "--detail-sample-dist", &config.detailSampleDist, 0.0f, 0.9f, false },
+				{ "--detail-sample-max-error", &config.detailSampleMaxError, 0.0f, 100.0f, false },
 			};
-			for (const auto& [name, field] : settings)
+			for (const Setting& setting : settings)
 			{
-				const auto found = options.find(name);
+				const auto found = options.find(setting.name);
 				if (found == options.end())
 					continue;
+				float value = 0.0f;
 				try
 				{
 					size_t used = 0;
-					const float value = std::stof(found->second, &used);
-					if (used != found->second.size() || !(value > 0.0f))
-						throw std::invalid_argument(name);
-					*field = value;
+					value = std::stof(found->second, &used);
+					if (used != found->second.size())
+						throw std::invalid_argument(setting.name);
 				}
 				catch (const std::exception&)
 				{
-					throw CliError(2, "bad_setting", std::string("Setting must be a positive number: ") + name);
+					throw CliError(2, "bad_setting", std::string("Setting must be a number: ") + setting.name);
 				}
+				if (!std::isfinite(value) || value < setting.low || value > setting.high
+					|| (setting.whole && value != std::floor(value)))
+				{
+					throw CliError(2, "bad_setting", fmt::format("{} must be {}from {} to {}.", setting.name,
+						setting.whole ? "a whole number " : "", setting.low, setting.high));
+				}
+				*setting.field = value;
 			}
 			navMesh->GetNavMeshConfig() = config;
 			spdlog::info("Settings: tile {} cell {} cellHeight {} height {} radius {} climb {} slope {}",
@@ -380,9 +390,15 @@ namespace
 						throw CliError(2, "bad_volumes", "Volume vertices must be [x,y,z].");
 					verts.emplace_back(v[0].GetFloat(), v[1].GetFloat(), v[2].GetFloat());
 				}
+				// Recast keeps areas in 6 bits; 0 is "not walkable", which a volume can't set here.
+				const unsigned int area = item["area"].GetUint();
+				if (area < 1 || area > 63)
+					throw CliError(2, "bad_volumes", "Volume area must be from 1 to 63.");
+				const float hmin = item["hmin"].GetFloat(), hmax = item["hmax"].GetFloat();
+				if (!(hmin < hmax))
+					throw CliError(2, "bad_volumes", "Volume hmin must be below hmax.");
 				const std::string name = item.HasMember("name") && item["name"].IsString() ? item["name"].GetString() : "";
-				navMesh->AddConvexVolume(verts, name, item["hmin"].GetFloat(), item["hmax"].GetFloat(),
-					static_cast<uint8_t>(item["area"].GetUint()));
+				navMesh->AddConvexVolume(verts, name, hmin, hmax, static_cast<uint8_t>(area));
 				++volumeCount;
 			}
 			spdlog::info("Added {} area volumes.", volumeCount);
@@ -434,8 +450,27 @@ namespace
 		if (!query)
 			throw CliError(5, "invalid_mesh", "No navigation query.");
 
+		// Read every point before printing anything, so a bad point gives one error and no partial output.
+		std::vector<std::array<float, 3>> locs;
+		{
+			std::stringstream points(RequiredOption(options, "--points"));
+			std::string item;
+			while (std::getline(points, item, ';'))
+			{
+				float y = 0, x = 0, z = 0;
+				if (sscanf_s(item.c_str(), "%f,%f,%f", &y, &x, &z) != 3
+					|| !std::isfinite(y) || !std::isfinite(x) || !std::isfinite(z))
+					throw CliError(2, "bad_points", "Points must be y,x,z;y,x,z");
+				locs.push_back({ y, x, z });
+			}
+			if (locs.empty())
+				throw CliError(2, "bad_points", "Points must be y,x,z;y,x,z");
+		}
+
+		// probe prints several lines: this header (ok and command), one line per point, and a gap line
+		// when a route is broken.
 		const auto& c = navMesh.GetNavMeshConfig();
-		fmt::print("{{\"mesh\":\"{}\",\"tiles\":{},\"cellSize\":{},\"cellHeight\":{},\"tileSize\":{},\"agentHeight\":{},\"agentRadius\":{},\"agentMaxClimb\":{},\"agentMaxSlope\":{}}}\n",
+		fmt::print("{{\"ok\":true,\"command\":\"probe\",\"mesh\":\"{}\",\"tiles\":{},\"cellSize\":{},\"cellHeight\":{},\"tileSize\":{},\"agentHeight\":{},\"agentRadius\":{},\"agentMaxClimb\":{},\"agentMaxSlope\":{}}}\n",
 			JsonEscape(meshPath.string()), CountTiles(navMesh.GetNavMesh()), c.cellSize, c.cellHeight, c.tileSize,
 			c.agentHeight, c.agentRadius, c.agentMaxClimb, c.agentMaxSlope);
 
@@ -446,17 +481,13 @@ namespace
 
 		const float nearBox[3] = { 5.f, 10.f, 5.f };
 		const float wide[3] = { 60.f, 60.f, 60.f };
-		std::stringstream points(RequiredOption(options, "--points"));
-		std::string item;
 		dtPolyRef startRef = 0;
 		float startPos[3] = { 0, 0, 0 };
 		bool first = true;
 		bool gapReported = false;
-		while (std::getline(points, item, ';'))
+		for (const auto& loc : locs)
 		{
-			float y = 0, x = 0, z = 0;
-			if (sscanf_s(item.c_str(), "%f,%f,%f", &y, &x, &z) != 3)
-				throw CliError(2, "bad_points", "Points must be y,x,z;y,x,z");
+			const float y = loc[0], x = loc[1], z = loc[2];
 			const float pos[3] = { x, z, y };
 			dtPolyRef ref = 0, wideRef = 0;
 			float hit[3] = { 0, 0, 0 }, wideHit[3] = { 0, 0, 0 };
@@ -464,14 +495,23 @@ namespace
 			query->findNearestPoly(pos, wide, &filter, &wideRef, wideHit);
 			if (first) { startRef = ref; dtVcopy(startPos, hit); first = false; }
 
-			std::string reach = "not_on_mesh";
+			// no_start: the first point is off the mesh, so no route can be tested.
+			// search_limit: Detour ran out of nodes or path space, which is not proof of a break.
+			std::string reach = !startRef ? "no_start" : "not_on_mesh";
 			int polys = 0;
 			std::string endForward = "null", endBack = "null";
 			if (ref && startRef)
 			{
 				dtPolyRef path[4096];
 				const dtStatus status = query->findPath(startRef, ref, startPos, hit, &filter, path, &polys, 4096);
-				reach = dtStatusFailed(status) ? "failed" : (polys > 0 && path[polys - 1] == ref ? "reachable" : "partial");
+				if (dtStatusFailed(status))
+					reach = "failed";
+				else if (polys > 0 && path[polys - 1] == ref)
+					reach = "reachable";
+				else if (dtStatusDetail(status, DT_OUT_OF_NODES) || dtStatusDetail(status, DT_BUFFER_TOO_SMALL))
+					reach = "search_limit";
+				else
+					reach = "partial";
 				if (reach == "partial")
 				{
 					// Where each side gets closest to the other: the break lies between these two.
@@ -492,7 +532,8 @@ namespace
 			{
 				gapReported = true;
 				const dtNavMesh* mesh = query->getAttachedNavMesh();
-				const auto flood = [mesh](dtPolyRef from) {
+				// Same filter as findPath, so the two regions agree with the route search.
+				const auto flood = [mesh, &filter](dtPolyRef from) {
 					std::vector<std::array<float, 3>> centres;
 					std::set<dtPolyRef> seen{ from };
 					std::vector<dtPolyRef> open{ from };
@@ -515,7 +556,7 @@ namespace
 							const dtPoly* nextPoly = nullptr;
 							if (!next || seen.count(next)) continue;
 							mesh->getTileAndPolyByRefUnsafe(next, &nextTile, &nextPoly);
-							if (nextPoly->flags & +PolyFlags::Disabled) continue;
+							if (!filter.passFilter(next, nextTile, nextPoly)) continue;
 							seen.insert(next);
 							open.push_back(next);
 						}
@@ -523,16 +564,24 @@ namespace
 					return centres;
 				};
 				const auto a = flood(startRef), b = flood(ref);
+				// Every pair is compared up to about 20 million checks. Past that, the larger
+				// side is sampled evenly and the result is marked approximate.
+				const auto& fewer = a.size() <= b.size() ? a : b;
+				const auto& more = a.size() <= b.size() ? b : a;
+				const size_t budget = 20000000;
+				const size_t step = (std::max<size_t>)(1, (fewer.size() * more.size()) / budget + 1);
 				float best = FLT_MAX;
-				std::array<float, 3> pa{ 0, 0, 0 }, pb{ 0, 0, 0 };
-				for (const auto& ca : a)
-					for (const auto& cb : b)
+				std::array<float, 3> ps{ 0, 0, 0 }, pl{ 0, 0, 0 };
+				for (const auto& cs : fewer)
+					for (size_t i = 0; i < more.size(); i += step)
 					{
-						const float d = dtVdist(ca.data(), cb.data());
-						if (d < best) { best = d; pa = ca; pb = cb; }
+						const float d = dtVdist(cs.data(), more[i].data());
+						if (d < best) { best = d; ps = cs; pl = more[i]; }
 					}
-				fmt::print("{{\"startRegionPolys\":{},\"pointRegionPolys\":{},\"gapDistance\":{:.1f},\"startSide\":[{:.1f},{:.1f},{:.1f}],\"pointSide\":[{:.1f},{:.1f},{:.1f}]}}\n",
-					a.size(), b.size(), best, pa[2], pa[0], pa[1], pb[2], pb[0], pb[1]);
+				const auto& pa = (&fewer == &a) ? ps : pl;
+				const auto& pb = (&fewer == &a) ? pl : ps;
+				fmt::print("{{\"startRegionPolys\":{},\"pointRegionPolys\":{},\"gapDistance\":{:.1f},\"approximate\":{},\"startSide\":[{:.1f},{:.1f},{:.1f}],\"pointSide\":[{:.1f},{:.1f},{:.1f}]}}\n",
+					a.size(), b.size(), best, step > 1, pa[2], pa[0], pa[1], pb[2], pb[0], pb[1]);
 			}
 		}
 		return 0;
