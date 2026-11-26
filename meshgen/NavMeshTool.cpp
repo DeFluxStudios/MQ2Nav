@@ -1002,7 +1002,60 @@ deleting_unique_ptr<rcCompactHeightfield> NavMeshTool::rasterizeGeometry(rcConfi
 	// remove unwanted overhangs caused by the conservative rasterization
 	// as well as filter spans where the character cannot possibly stand.
 	rcFilterLowHangingWalkableObstacles(m_ctx, cfg.walkableClimb, *solid);
+
+	// Walkways: the ledge filter removes narrow logs and planks before erosion ever sees them.
+	// Remember walkable spans inside walkway volumes, put back only the ones the ledge filter
+	// removed, and let the headroom filter run afterwards so low ceilings still count.
+	std::vector<std::pair<rcSpan*, unsigned char>> walkwaySpans;
+	if (m_protectWalkways)
+	{
+		for (const auto& vol : m_navMesh->GetConvexVolumes())
+		{
+			std::string name = vol->name;
+			std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(::tolower(c)); });
+			if (name.rfind("walkway", 0) != 0 || vol->verts.size() < 3)
+				continue;
+			for (int z = 0; z < solid->height; ++z)
+			{
+				for (int x = 0; x < solid->width; ++x)
+				{
+					const float px = solid->bmin[0] + (x + 0.5f) * solid->cs;
+					const float pz = solid->bmin[2] + (z + 0.5f) * solid->cs;
+					bool inside = false;
+					for (size_t i = 0, j = vol->verts.size() - 1; i < vol->verts.size(); j = i++)
+					{
+						const glm::vec3& a = vol->verts[i];
+						const glm::vec3& b = vol->verts[j];
+						if (((a.z > pz) != (b.z > pz)) && (px < (b.x - a.x) * (pz - a.z) / (b.z - a.z) + a.x))
+							inside = !inside;
+					}
+					if (!inside)
+						continue;
+					for (rcSpan* span = solid->spans[x + z * solid->width]; span; span = span->next)
+					{
+						const float top = solid->bmin[1] + span->smax * solid->ch;
+						if (span->area != RC_NULL_AREA && top >= vol->hmin && top <= vol->hmax)
+							walkwaySpans.emplace_back(span, static_cast<unsigned char>(span->area));
+					}
+				}
+			}
+		}
+	}
+
 	rcFilterLedgeSpans(m_ctx, cfg.walkableHeight, cfg.walkableClimb, *solid);
+
+	int walkwayRestored = 0;
+	for (const auto& [span, area] : walkwaySpans)
+	{
+		if (span->area == RC_NULL_AREA)
+		{
+			span->area = area;
+			++walkwayRestored;
+		}
+	}
+	if (!walkwaySpans.empty())
+		SPDLOG_LOGGER_INFO(m_logger, "Walkways: {} spans in walkways, {} kept from the ledge filter.", walkwaySpans.size(), walkwayRestored);
+
 	rcFilterWalkableLowHeightSpans(m_ctx, cfg.walkableHeight, *solid);
 
 	// Compact the heightfield so that it is faster to handle from now on.
@@ -1094,12 +1147,56 @@ unsigned char* NavMeshTool::buildTileMesh(
 	if (!chf)
 		return 0;
 
+	// Walkways: note which spans fall inside walkway volumes before erosion, so they can be put
+	// back afterwards. rcMarkConvexPolyArea skips null spans, so this must happen first.
+	std::vector<unsigned char> walkwayAreas;
+	if (m_protectWalkways)
+	{
+		const auto& walkwayVolumes = m_navMesh->GetConvexVolumes();
+		const unsigned char marker = 62;
+		std::vector<unsigned char> saved(chf->areas, chf->areas + chf->spanCount);
+		bool any = false;
+		for (const auto& vol : walkwayVolumes)
+		{
+			std::string name = vol->name;
+			std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(::tolower(c)); });
+			if (name.rfind("walkway", 0) != 0 || vol->verts.size() < 3)
+				continue;
+			rcMarkConvexPolyArea(m_ctx, glm::value_ptr(vol->verts[0]), static_cast<int>(vol->verts.size()),
+				vol->hmin, vol->hmax, marker, *chf);
+			any = true;
+		}
+		if (any)
+		{
+			walkwayAreas.assign(chf->spanCount, 0);
+			for (int i = 0; i < chf->spanCount; ++i)
+			{
+				if (chf->areas[i] == marker && saved[i] != RC_NULL_AREA && saved[i] != marker)
+					walkwayAreas[i] = saved[i];
+				chf->areas[i] = saved[i];
+			}
+		}
+	}
+
 	// Erode the walkable area by agent radius.
 	if (!rcErodeWalkableArea(m_ctx, cfg.walkableRadius, *chf))
 	{
 		SPDLOG_LOGGER_ERROR(m_logger, "buildNavigation: Could not erode.");
 		return 0;
 	}
+
+	int erosionRestored = 0;
+	for (size_t i = 0; i < walkwayAreas.size(); ++i)
+	{
+		if (walkwayAreas[i])
+		{
+			if (chf->areas[i] != walkwayAreas[i])
+				++erosionRestored;
+			chf->areas[i] = walkwayAreas[i];
+		}
+	}
+	if (!walkwayAreas.empty())
+		SPDLOG_LOGGER_INFO(m_logger, "Walkways: {} spans kept from erosion.", erosionRestored);
 
 	// Mark areas.
 	const auto& volumes = m_navMesh->GetConvexVolumes();

@@ -102,6 +102,10 @@ public:
 	// Headless builds set agent and cell settings here before handleBuild.
 	NavMeshConfig& GetConfig() { return m_config; }
 
+	// Walkways: volumes named "walkway..." keep their spans through the agent-radius erosion,
+	// so narrow logs, planks and ledges stay walkable. Off unless asked for.
+	void SetProtectWalkways(bool protect) { m_protectWalkways = protect; }
+
 	void handleDebug();
 	void handleTools();
 	void handleRender();
@@ -193,6 +197,7 @@ private:
 
 	char* m_outputPath = nullptr;
 	float m_totalBuildTimeMs = 0.f;
+	bool m_protectWalkways = false;
 
 	int m_tilesWidth = 0;
 	int m_tilesHeight = 0;
