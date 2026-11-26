@@ -10,7 +10,7 @@ int main(int argc, char* argv[])
 	if (argc > 1)
 	{
 		const std::string command = argv[1];
-		if (command == "build" || command == "validate"
+		if (command == "build" || command == "validate" || command == "probe"
 			|| command == "--help" || command == "-h")
 		{
 			return RunHeadlessCli(argc, argv);

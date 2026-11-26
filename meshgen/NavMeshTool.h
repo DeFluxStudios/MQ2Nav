@@ -99,6 +99,9 @@ public:
 
 	void setContext(rcContext* ctx) { m_ctx = ctx; }
 
+	// Headless builds set agent and cell settings here before handleBuild.
+	NavMeshConfig& GetConfig() { return m_config; }
+
 	void handleDebug();
 	void handleTools();
 	void handleRender();

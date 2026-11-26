@@ -193,14 +193,8 @@ public:
 
 		EQEmu::PFS::Archive archive;
 
-		for (int i = 0; i < 3; i++)
+		for (const std::string suffix : { "", "_obj", "_obj2", "_2_obj" })
 		{
-			std::string suffix;
-			if (i > 0)
-				suffix = "_obj";
-			if (i > 1)
-				suffix += std::to_string(i);
-
 			std::string wld_name = m_zd->GetZoneName() + suffix + ".wld";
 			std::string file_name = (boost::format("%s\\%s.s3d")
 				% m_zd->GetEQPath() % (m_zd->GetZoneName() + suffix)).str();

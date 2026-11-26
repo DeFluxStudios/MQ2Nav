@@ -10,13 +10,22 @@
 #include "meshgen/MapGeometryLoader.h"
 #include "meshgen/NavMeshTool.h"
 
+#include <array>
+#include <cfloat>
+#include <set>
+#include <vector>
+#include <DetourCommon.h>
 #include <DetourNavMesh.h>
+#include <DetourNavMeshQuery.h>
 #include <Recast.h>
 #include <fmt/format.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <rapidjson/document.h>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -110,7 +119,13 @@ namespace
 		fmt::print(
 			"MeshGenerator headless commands:\n"
 			"  MeshGenerator.exe build --zone SHORTNAME --eq-path PATH --stage-root PATH [--mesh-root PATH] [--no-max-extents]\n"
+			"      [--tile-size N] [--cell-size N] [--cell-height N] [--agent-height N] [--agent-radius N]\n"
+			"      [--max-climb N] [--max-slope N] [--region-min-size N] [--region-merge-size N]\n"
+			"      [--detail-sample-dist N] [--detail-sample-max-error N]   (defaults: MQ2Nav's own)\n"
+			"      [--connections FILE]   JSON array of {\"start\":[x,y,z],\"end\":[x,y,z]} in mesh axes, y up\n"
+			"      [--volumes FILE]       JSON array of {\"verts\":[[x,y,z],...],\"hmin\":N,\"hmax\":N,\"area\":N}\n"
 			"  MeshGenerator.exe validate --zone SHORTNAME --mesh PATH\n"
+			"  MeshGenerator.exe probe --zone SHORTNAME --mesh PATH --points FILE\n"
 			"\n"
 			"Build writes <stage-root>\\MQ2Nav\\<zone>.navmesh and never overwrites an existing file.\n"
 			"Progress and diagnostics are written to stderr; each command writes one JSON result to stdout.\n");
@@ -259,6 +274,120 @@ namespace
 		navMeshTool.setContext(&context);
 		navMeshTool.setOutputPath(stageRoot.string().c_str());
 		navMeshTool.handleGeometryChanged(geometry.get());
+
+		// Optional settings. Anything not given keeps the MQ2Nav default.
+		{
+			NavMeshConfig& config = navMeshTool.GetConfig();
+			const std::pair<const char*, float*> settings[] = {
+				{ "--tile-size", &config.tileSize },
+				{ "--cell-size", &config.cellSize },
+				{ "--cell-height", &config.cellHeight },
+				{ "--agent-height", &config.agentHeight },
+				{ "--agent-radius", &config.agentRadius },
+				{ "--max-climb", &config.agentMaxClimb },
+				{ "--max-slope", &config.agentMaxSlope },
+				{ "--region-min-size", &config.regionMinSize },
+				{ "--region-merge-size", &config.regionMergeSize },
+				{ "--detail-sample-dist", &config.detailSampleDist },
+				{ "--detail-sample-max-error", &config.detailSampleMaxError },
+			};
+			for (const auto& [name, field] : settings)
+			{
+				const auto found = options.find(name);
+				if (found == options.end())
+					continue;
+				try
+				{
+					size_t used = 0;
+					const float value = std::stof(found->second, &used);
+					if (used != found->second.size() || !(value > 0.0f))
+						throw std::invalid_argument(name);
+					*field = value;
+				}
+				catch (const std::exception&)
+				{
+					throw CliError(2, "bad_setting", std::string("Setting must be a positive number: ") + name);
+				}
+			}
+			navMesh->GetNavMeshConfig() = config;
+			spdlog::info("Settings: tile {} cell {} cellHeight {} height {} radius {} climb {} slope {}",
+				config.tileSize, config.cellSize, config.cellHeight, config.agentHeight,
+				config.agentRadius, config.agentMaxClimb, config.agentMaxSlope);
+		}
+
+		// Optional off-mesh links, baked into the tiles by the build. File: a JSON array of
+		// {"start":[x,y,z],"end":[x,y,z],"bidirectional":true,"name":"..."} in mesh axes (y is up).
+		int connectionCount = 0;
+		if (const auto found = options.find("--connections"); found != options.end())
+		{
+			std::ifstream file(found->second, std::ios::binary);
+			if (!file)
+				throw CliError(3, "missing_connections", "Connections file not found: " + found->second);
+			const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+			rapidjson::Document document;
+			document.Parse(text.c_str());
+			if (document.HasParseError() || !document.IsArray())
+				throw CliError(2, "bad_connections", "Connections file must be a JSON array.");
+			auto readPoint = [](const rapidjson::Value& item, const char* key, glm::vec3& out) {
+				if (!item.HasMember(key) || !item[key].IsArray() || item[key].Size() != 3)
+					return false;
+				for (rapidjson::SizeType i = 0; i < 3; ++i)
+				{
+					if (!item[key][i].IsNumber())
+						return false;
+					out[i] = item[key][i].GetFloat();
+				}
+				return true;
+			};
+			for (const auto& item : document.GetArray())
+			{
+				auto connection = std::make_unique<OffMeshConnection>();
+				if (!item.IsObject() || !readPoint(item, "start", connection->start) || !readPoint(item, "end", connection->end))
+					throw CliError(2, "bad_connections", "Each connection needs start and end as [x,y,z].");
+				if (item.HasMember("bidirectional") && item["bidirectional"].IsBool())
+					connection->bidirectional = item["bidirectional"].GetBool();
+				if (item.HasMember("name") && item["name"].IsString())
+					connection->name = item["name"].GetString();
+				navMesh->AddConnection(std::move(connection));
+				++connectionCount;
+			}
+			spdlog::info("Added {} off-mesh connections.", connectionCount);
+		}
+
+		// Optional area volumes (water, avoid, and so on). File: a JSON array of
+		// {"verts":[[x,y,z],...],"hmin":N,"hmax":N,"area":N,"name":"..."} in mesh axes (y is up).
+		if (const auto found = options.find("--volumes"); found != options.end())
+		{
+			std::ifstream file(found->second, std::ios::binary);
+			if (!file)
+				throw CliError(3, "missing_volumes", "Volumes file not found: " + found->second);
+			const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+			rapidjson::Document document;
+			document.Parse(text.c_str());
+			if (document.HasParseError() || !document.IsArray())
+				throw CliError(2, "bad_volumes", "Volumes file must be a JSON array.");
+			int volumeCount = 0;
+			for (const auto& item : document.GetArray())
+			{
+				if (!item.IsObject() || !item.HasMember("verts") || !item["verts"].IsArray() || item["verts"].Size() < 3
+					|| !item.HasMember("hmin") || !item["hmin"].IsNumber() || !item.HasMember("hmax") || !item["hmax"].IsNumber()
+					|| !item.HasMember("area") || !item["area"].IsUint())
+					throw CliError(2, "bad_volumes", "Each volume needs verts (3 or more), hmin, hmax and area.");
+				std::vector<glm::vec3> verts;
+				for (const auto& v : item["verts"].GetArray())
+				{
+					if (!v.IsArray() || v.Size() != 3 || !v[0].IsNumber() || !v[1].IsNumber() || !v[2].IsNumber())
+						throw CliError(2, "bad_volumes", "Volume vertices must be [x,y,z].");
+					verts.emplace_back(v[0].GetFloat(), v[1].GetFloat(), v[2].GetFloat());
+				}
+				const std::string name = item.HasMember("name") && item["name"].IsString() ? item["name"].GetString() : "";
+				navMesh->AddConvexVolume(verts, name, item["hmin"].GetFloat(), item["hmax"].GetFloat(),
+					static_cast<uint8_t>(item["area"].GetUint()));
+				++volumeCount;
+			}
+			spdlog::info("Added {} area volumes.", volumeCount);
+		}
+
 		navMeshTool.UpdateTileSizes();
 		spdlog::info("Building zone {} synchronously.", zone);
 		if (!navMeshTool.handleBuild(false, false))
@@ -292,6 +421,122 @@ namespace
 			JsonEscape(zone), JsonEscape(outputPath.string()), tileCount);
 		return 0;
 	}
+	// Reads a mesh and reports, using MQ2Nav's own search box, whether each point is on it and
+	// reachable from the first point. Points are /loc order: "y,x,z;y,x,z". Never writes anything.
+	int ProbeMesh(const Options& options)
+	{
+		const std::string zone = GetZone(options);
+		const fs::path meshPath = fs::absolute(RequiredOption(options, "--mesh")).lexically_normal();
+		NavMesh navMesh("", zone);
+		if (navMesh.LoadNavMeshFile(meshPath.string()) != NavMesh::LoadResult::Success)
+			throw CliError(5, "invalid_mesh", "Mesh could not be loaded.");
+		auto query = navMesh.GetNavMeshQuery();
+		if (!query)
+			throw CliError(5, "invalid_mesh", "No navigation query.");
+
+		const auto& c = navMesh.GetNavMeshConfig();
+		fmt::print("{{\"mesh\":\"{}\",\"tiles\":{},\"cellSize\":{},\"cellHeight\":{},\"tileSize\":{},\"agentHeight\":{},\"agentRadius\":{},\"agentMaxClimb\":{},\"agentMaxSlope\":{}}}\n",
+			JsonEscape(meshPath.string()), CountTiles(navMesh.GetNavMesh()), c.cellSize, c.cellHeight, c.tileSize,
+			c.agentHeight, c.agentRadius, c.agentMaxClimb, c.agentMaxSlope);
+
+		dtQueryFilter filter;
+		filter.setIncludeFlags(+PolyFlags::All);
+		filter.setExcludeFlags(+PolyFlags::Disabled);
+		navMesh.FillFilterAreaCosts(filter);
+
+		const float nearBox[3] = { 5.f, 10.f, 5.f };
+		const float wide[3] = { 60.f, 60.f, 60.f };
+		std::stringstream points(RequiredOption(options, "--points"));
+		std::string item;
+		dtPolyRef startRef = 0;
+		float startPos[3] = { 0, 0, 0 };
+		bool first = true;
+		bool gapReported = false;
+		while (std::getline(points, item, ';'))
+		{
+			float y = 0, x = 0, z = 0;
+			if (sscanf_s(item.c_str(), "%f,%f,%f", &y, &x, &z) != 3)
+				throw CliError(2, "bad_points", "Points must be y,x,z;y,x,z");
+			const float pos[3] = { x, z, y };
+			dtPolyRef ref = 0, wideRef = 0;
+			float hit[3] = { 0, 0, 0 }, wideHit[3] = { 0, 0, 0 };
+			query->findNearestPoly(pos, nearBox, &filter, &ref, hit);
+			query->findNearestPoly(pos, wide, &filter, &wideRef, wideHit);
+			if (first) { startRef = ref; dtVcopy(startPos, hit); first = false; }
+
+			std::string reach = "not_on_mesh";
+			int polys = 0;
+			std::string endForward = "null", endBack = "null";
+			if (ref && startRef)
+			{
+				dtPolyRef path[4096];
+				const dtStatus status = query->findPath(startRef, ref, startPos, hit, &filter, path, &polys, 4096);
+				reach = dtStatusFailed(status) ? "failed" : (polys > 0 && path[polys - 1] == ref ? "reachable" : "partial");
+				if (reach == "partial")
+				{
+					// Where each side gets closest to the other: the break lies between these two.
+					float end[3] = { 0, 0, 0 };
+					if (dtStatusSucceed(query->closestPointOnPoly(path[polys - 1], hit, end, nullptr)))
+						endForward = fmt::format("[{:.1f},{:.1f},{:.1f}]", end[2], end[0], end[1]);
+					int backPolys = 0;
+					if (dtStatusSucceed(query->findPath(ref, startRef, hit, startPos, &filter, path, &backPolys, 4096)) && backPolys > 0
+						&& dtStatusSucceed(query->closestPointOnPoly(path[backPolys - 1], startPos, end, nullptr)))
+						endBack = fmt::format("[{:.1f},{:.1f},{:.1f}]", end[2], end[0], end[1]);
+				}
+			}
+			fmt::print("{{\"y\":{},\"x\":{},\"z\":{},\"onMesh\":{},\"route\":\"{}\",\"polys\":{},\"nearestWithin60\":{},\"startSideEnd\":{},\"pointSideEnd\":{}}}\n",
+				y, x, z, ref != 0, reach, polys,
+				wideRef ? fmt::format("[{:.1f},{:.1f},{:.1f}]", wideHit[2], wideHit[0], wideHit[1]) : "null", endForward, endBack);
+
+			if (reach == "partial" && !gapReported)
+			{
+				gapReported = true;
+				const dtNavMesh* mesh = query->getAttachedNavMesh();
+				const auto flood = [mesh](dtPolyRef from) {
+					std::vector<std::array<float, 3>> centres;
+					std::set<dtPolyRef> seen{ from };
+					std::vector<dtPolyRef> open{ from };
+					while (!open.empty())
+					{
+						const dtPolyRef cur = open.back();
+						open.pop_back();
+						const dtMeshTile* tile = nullptr;
+						const dtPoly* poly = nullptr;
+						mesh->getTileAndPolyByRefUnsafe(cur, &tile, &poly);
+						std::array<float, 3> c{ 0, 0, 0 };
+						for (int v = 0; v < poly->vertCount; ++v)
+							for (int a = 0; a < 3; ++a)
+								c[a] += tile->verts[poly->verts[v] * 3 + a] / poly->vertCount;
+						centres.push_back(c);
+						for (unsigned int l = poly->firstLink; l != DT_NULL_LINK; l = tile->links[l].next)
+						{
+							const dtPolyRef next = tile->links[l].ref;
+							const dtMeshTile* nextTile = nullptr;
+							const dtPoly* nextPoly = nullptr;
+							if (!next || seen.count(next)) continue;
+							mesh->getTileAndPolyByRefUnsafe(next, &nextTile, &nextPoly);
+							if (nextPoly->flags & +PolyFlags::Disabled) continue;
+							seen.insert(next);
+							open.push_back(next);
+						}
+					}
+					return centres;
+				};
+				const auto a = flood(startRef), b = flood(ref);
+				float best = FLT_MAX;
+				std::array<float, 3> pa{ 0, 0, 0 }, pb{ 0, 0, 0 };
+				for (const auto& ca : a)
+					for (const auto& cb : b)
+					{
+						const float d = dtVdist(ca.data(), cb.data());
+						if (d < best) { best = d; pa = ca; pb = cb; }
+					}
+				fmt::print("{{\"startRegionPolys\":{},\"pointRegionPolys\":{},\"gapDistance\":{:.1f},\"startSide\":[{:.1f},{:.1f},{:.1f}],\"pointSide\":[{:.1f},{:.1f},{:.1f}]}}\n",
+					a.size(), b.size(), best, pa[2], pa[0], pa[1], pb[2], pb[0], pb[1]);
+			}
+		}
+		return 0;
+	}
 }
 
 int RunHeadlessCli(int argc, char* argv[])
@@ -313,7 +558,10 @@ int RunHeadlessCli(int argc, char* argv[])
 		if (command == "build")
 		{
 			const Options options = ParseOptions(argc, argv,
-				{ "--zone", "--eq-path", "--stage-root", "--mesh-root" },
+				{ "--zone", "--eq-path", "--stage-root", "--mesh-root",
+					"--tile-size", "--cell-size", "--cell-height", "--agent-height", "--agent-radius",
+					"--max-climb", "--max-slope", "--region-min-size", "--region-merge-size",
+					"--detail-sample-dist", "--detail-sample-max-error", "--connections", "--volumes" },
 				{ "--no-max-extents" });
 			return BuildMesh(options);
 		}
@@ -323,6 +571,11 @@ int RunHeadlessCli(int argc, char* argv[])
 			return ValidateMesh(options);
 		}
 
+		if (command == "probe")
+		{
+			const Options options = ParseOptions(argc, argv, { "--zone", "--mesh", "--points" }, {});
+			return ProbeMesh(options);
+		}
 		throw CliError(2, "unknown_command", "Unknown headless command: " + command);
 	}
 	catch (const CliError& error)
